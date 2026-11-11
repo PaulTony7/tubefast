@@ -13,3 +13,4 @@
 - Artwork requests stay bounded while you browse large libraries
 - Changing tracks stops stream lookups that are no longer needed
 - Browse podcast shows and play their episodes from the Podcasts sidebar entry
+- Unavailable videos are skipped without skipping songs for connection or sign-in failures
