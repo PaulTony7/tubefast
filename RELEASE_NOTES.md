@@ -10,3 +10,6 @@
 - A song that stalls or fails to load now retries and resumes from the same spot. The play button shows when it is buffering and offers a retry if it gives up
 - On Linux, the song artist and volume changes from the desktop now show up correctly in media controls
 - In narrow windows the queue now takes the place of the main content
+- Artwork requests stay bounded while you browse large libraries
+- Changing tracks stops stream lookups that are no longer needed
+- Browse podcast shows and play their episodes from the Podcasts sidebar entry
