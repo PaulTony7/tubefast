@@ -114,7 +114,7 @@ fn main() -> eframe::Result {
         (Some(query), None) if !query.starts_with("--") => (Some(query), false),
         _ => (None, false),
     };
-    run_window(query, autoplay, updated)
+    run_window(query, autoplay)
 }
 
 fn native_options() -> eframe::NativeOptions {
@@ -131,18 +131,18 @@ fn native_options() -> eframe::NativeOptions {
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-fn run_window(query: Option<String>, autoplay: bool, updated: bool) -> eframe::Result {
+fn run_window(query: Option<String>, autoplay: bool) -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         native_options(),
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, query, autoplay, updated)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, query, autoplay)))),
     )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn run_window(query: Option<String>, autoplay: bool, updated: bool) -> eframe::Result {
+fn run_window(query: Option<String>, autoplay: bool) -> eframe::Result {
     let slot = parked::Slot::default();
-    let mut first_start = Some((query, autoplay, updated));
+    let mut first_start = Some((query, autoplay));
     let mut failed_windows = 0;
     loop {
         let (handover, start) = (slot.clone(), first_start.take());
@@ -156,8 +156,8 @@ fn run_window(query: Option<String>, autoplay: bool, updated: bool) -> eframe::R
                         parked
                     }
                     None => {
-                        let (query, autoplay, updated) = start.unwrap_or_default();
-                        Box::new(app::App::new(cc, query, autoplay, updated))
+                        let (query, autoplay) = start.unwrap_or_default();
+                        Box::new(app::App::new(cc, query, autoplay))
                     }
                 };
                 Ok(Box::new(parked::Hosted::new(app, handover)))

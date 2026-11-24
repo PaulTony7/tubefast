@@ -27,7 +27,6 @@ const PAGES_KEPT_ON_TRIM: usize = 8;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
-const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
 const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const HOME_SEEDS: usize = 3;
@@ -97,7 +96,6 @@ pub struct Saved {
     pub overlay_controls: bool,
     pub overlay_next_up: bool,
     pub auto_update_checks: bool,
-    pub notes_seen: String,
     pub browser: String,
 }
 
@@ -180,7 +178,6 @@ impl Default for Saved {
             overlay_controls: true,
             overlay_next_up: true,
             auto_update_checks: false,
-            notes_seen: String::new(),
             browser: String::new(),
         }
     }
@@ -245,7 +242,6 @@ pub enum Action {
     Undo,
     GetUpdate,
     OpenRelease,
-    CloseNotes,
     AutoUpdateChecks(bool),
     #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
     Pause(bool),
@@ -343,7 +339,6 @@ pub struct App {
     pub overlay_snapping: bool,
     #[cfg(all(unix, not(target_os = "macos")))]
     pub layer_overlay: std::cell::OnceCell<Option<crate::overlay_wayland::Handle>>,
-    pub notes: Vec<String>,
     restart: Option<PathBuf>,
     #[cfg(all(unix, not(target_os = "macos")))]
     parking: bool,
@@ -352,7 +347,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool, updated: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool) -> Self {
         ui::install(&cc.egui_ctx);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
@@ -363,8 +358,6 @@ impl App {
         }
         yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
-        let fresh_version = saved.notes_seen != VERSION && (updated || !saved.notes_seen.is_empty());
-        saved.notes_seen = VERSION.to_owned();
         let ctx = cc.egui_ctx.clone();
         let (signals, signaled) = mpsc::channel();
         let mut player = Player::new(yt.clone(), {
@@ -440,7 +433,6 @@ impl App {
             overlay_snapping: false,
             #[cfg(all(unix, not(target_os = "macos")))]
             layer_overlay: std::cell::OnceCell::new(),
-            notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
             #[cfg(all(unix, not(target_os = "macos")))]
             parking: false,
@@ -1234,7 +1226,6 @@ impl App {
                     }
                 }
             }
-            Action::CloseNotes => self.notes.clear(),
             Action::Move(from, gap) => playback.reorder(from, gap),
             Action::Expand(open) => self.expanded = open && self.saved.current.is_some(),
             Action::RomanizeLyrics(romanized) => self.saved.lyrics_romanized = romanized,
@@ -1490,14 +1481,6 @@ fn toggle(list: &mut Vec<Item>, item: Item) {
     }
 }
 
-fn release_notes(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|line| line.trim().trim_start_matches(['-', '*']).trim())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
-}
-
 fn settle_section(page: &mut Page, at: usize, target: &Target, items: Vec<Item>) {
     if let Some(section) = page.sections.get_mut(at).filter(|section| section.all.as_ref() == Some(target)) {
         section.all = None;
@@ -1577,12 +1560,6 @@ mod tests {
         assert_eq!(usable_opacity(7.0), 1.0);
         assert_eq!(usable_opacity(f32::INFINITY), 1.0);
         assert_eq!(usable_opacity(0.5), 0.5);
-    }
-
-    #[test]
-    fn reads_release_notes_as_plain_lines() {
-        let notes = release_notes("# 0.7.2\n\n- Faster search\n* Lyrics stay in sync\n   \n");
-        assert_eq!(notes, ["Faster search", "Lyrics stay in sync"]);
     }
 
     #[test]
