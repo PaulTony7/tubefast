@@ -3501,7 +3501,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tubefast"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "ashpd",
  "async-channel",
@@ -3511,8 +3511,10 @@ dependencies = [
  "egui-phosphor",
  "futures-lite",
  "global-hotkey",
+ "glutin",
  "image",
  "ksni",
+ "libc",
  "memmap2",
  "mpris-server",
  "objc2 0.6.5",
@@ -3525,6 +3527,7 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "smithay-client-toolkit 0.20.0",
  "symphonia",
  "tray-icon",
  "ureq",

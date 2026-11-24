@@ -2,6 +2,8 @@ use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, 
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
+#[cfg(all(unix, not(target_os = "macos")))]
+use crate::overlay_wayland;
 use crate::ytm::{Item, Layout, PODCASTS, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -63,7 +65,7 @@ const STATUS_ROW: f32 = 26.0;
 const SECTION_GAP: f32 = 32.0;
 const OVERLAY_TITLE: &str = "Tubefast overlay";
 const OVERLAY_CLOSE_DIM: f32 = 0.22;
-const OVERLAY_WIDTH: f32 = 340.0;
+pub const OVERLAY_WIDTH: f32 = 340.0;
 const OVERLAY_HOME: [f32; 2] = [24.0, 24.0];
 const OVERLAY_ROWS: usize = 4;
 const OVERLAY_ROW: f32 = 48.0;
@@ -503,7 +505,12 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
         .show(ctx, |ui| player_bar(app, ui, &mut out))
         .inner;
     let mut frame = PANEL;
+    let forget_scroll = |heading: bool| ctx.data_mut(|data| data.remove_temp::<String>(Id::new(("queue-scrolled", heading))));
     if app.expanded && app.now_playing().is_some() {
+        forget_scroll(true);
+        if app.saved.lyrics_open {
+            forget_scroll(false);
+        }
         frame = egui::CentralPanel::default()
             .frame(plain(PANEL))
             .show(ctx, |ui| now_playing(app, ui, &mut out))
@@ -518,6 +525,12 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
         let queue_wanted = app.saved.queue_open;
         let queue_fits = queue_wanted && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
         let queue_instead = queue_wanted && !queue_fits;
+        forget_scroll(false);
+        let beside = Id::new("queue-beside");
+        if !queue_wanted || ctx.data(|data| data.get_temp::<bool>(beside)) != Some(queue_fits) {
+            ctx.data_mut(|data| data.insert_temp(beside, queue_fits));
+            forget_scroll(true);
+        }
         egui::SidePanel::right("queue")
             .exact_width(QUEUE_WIDTH)
             .resizable(false)
@@ -540,9 +553,76 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     out
 }
 
+#[derive(Clone, PartialEq)]
+pub struct OverlayEntry {
+    pub index: usize,
+    pub title: String,
+    pub subtitle: String,
+    pub cover: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct OverlayView {
+    pub controls: bool,
+    pub playing: bool,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub track: Option<OverlayEntry>,
+    pub next_up: Vec<OverlayEntry>,
+}
+
+impl OverlayView {
+    fn of(app: &App) -> Self {
+        let entry = |index: usize, item: &Item| OverlayEntry {
+            index,
+            title: item.title.clone(),
+            subtitle: item.subtitle.clone(),
+            cover: app.saved.covers.of(item).to_owned(),
+        };
+        let upcoming = overlay_upcoming(app);
+        let rows = if app.saved.overlay_next_up {
+            app.saved.queue.len().saturating_sub(upcoming).min(OVERLAY_ROWS)
+        } else {
+            0
+        };
+        Self {
+            controls: app.saved.overlay_controls,
+            playing: app.playing(),
+            position_ms: app.player.position_ms(),
+            duration_ms: app.player.duration_ms(),
+            track: app
+                .saved
+                .current
+                .and_then(|current| Some(entry(current, app.saved.queue.get(current)?))),
+            next_up: (upcoming..upcoming + rows)
+                .map(|index| entry(index, &app.saved.queue[index]))
+                .collect(),
+        }
+    }
+
+    pub fn height(&self) -> f32 {
+        overlay_height(self.next_up.len(), self.controls)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn draw_overlay_card(ctx: &egui::Context, view: &OverlayView, art: &Art, opacity: f32) -> Vec<Action> {
+    let mut out = Vec::new();
+    egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+        ui.multiply_opacity(opacity);
+        overlay_card(view, art, ui, &mut out);
+    });
+    out
+}
+
 pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let mut out = Vec::new();
-    if !(app.saved.overlay && app.overlay_open) {
+    let open = app.saved.overlay && app.overlay_open;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if hotkeys::layer_overlay() {
+        return layer_overlay(app, open);
+    }
+    if !open {
         forget_overlay_window();
         return out;
     }
@@ -550,7 +630,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let saved = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
     let builder = egui::ViewportBuilder::default()
         .with_title(OVERLAY_TITLE)
-        .with_inner_size([OVERLAY_WIDTH, overlay_height(overlay_rows(app), app.saved.overlay_controls)])
+        .with_inner_size([OVERLAY_WIDTH, OverlayView::of(app).height()])
         .with_position(home)
         .with_decorations(false)
         .with_always_on_top()
@@ -564,7 +644,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
             if !cfg!(windows) {
                 ui.multiply_opacity(usable_opacity(app.saved.overlay_opacity));
             }
-            overlay_card(app, ui, &mut out);
+            overlay_card(&OverlayView::of(app), &app.art, ui, &mut out);
         });
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
         let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
@@ -581,6 +661,30 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
             out.push(Action::ToggleOverlay);
         }
     });
+    out
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn layer_overlay(app: &App, open: bool) -> Vec<Action> {
+    if !open {
+        if let Some(Some(handle)) = app.layer_overlay.get() {
+            handle.hide();
+        }
+        return Vec::new();
+    }
+    let started = app.layer_overlay.get_or_init(|| overlay_wayland::Handle::start(app.http_agent()));
+    let Some(handle) = started else {
+        return vec![Action::ToggleOverlay];
+    };
+    handle.show(overlay_wayland::Frame {
+        view: OverlayView::of(app),
+        opacity: usable_opacity(app.saved.overlay_opacity),
+        position: app.saved.overlay_position.unwrap_or(OVERLAY_HOME),
+    });
+    let mut out = handle.actions();
+    if app.overlay_snapping {
+        out.push(Action::OverlaySnapped);
+    }
     out
 }
 
@@ -662,13 +766,6 @@ fn overlay_upcoming(app: &App) -> usize {
     app.saved.current.map_or(0, |current| current + 1)
 }
 
-fn overlay_rows(app: &App) -> usize {
-    if !app.saved.overlay_next_up {
-        return 0;
-    }
-    app.saved.queue.len().saturating_sub(overlay_upcoming(app)).min(OVERLAY_ROWS)
-}
-
 fn overlay_base_height(controls: bool) -> f32 {
     2.0 * OVERLAY_PAD + OVERLAY_ART + 38.0 + if controls { 28.0 } else { 0.0 }
 }
@@ -678,10 +775,9 @@ fn overlay_height(rows: usize, controls: bool) -> f32 {
     overlay_base_height(controls) + queue_height
 }
 
-fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
-    let upcoming = overlay_upcoming(app);
-    let rows = overlay_rows(app);
-    let controls = app.saved.overlay_controls;
+fn overlay_card(view: &OverlayView, art: &Art, ui: &mut Ui, out: &mut Vec<Action>) {
+    let rows = view.next_up.len();
+    let controls = view.controls;
     let height = overlay_height(rows, controls);
     let area = ui.max_rect();
     let card = Rect::from_min_size(area.min, vec2(area.width(), height));
@@ -723,30 +819,29 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     {
         out.push(Action::ToggleOverlay);
     }
-    let item = app.now_playing();
-    let art = Rect::from_min_size(inner.min, Vec2::splat(OVERLAY_ART));
-    let (left, width) = (art.right() + 12.0, inner.right() - art.right() - 52.0);
-    match item {
-        Some(item) => {
-            artwork(ui, &app.art, app.saved.covers.of(item), art, 8.0);
-            let (title, byline) = (pos2(left, art.center().y - 10.0), pos2(left, art.center().y + 10.0));
-            label(ui, title, Align2::LEFT_CENTER, &item.title, medium(14.0), TEXT, width);
-            label(ui, byline, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
+    let cover = Rect::from_min_size(inner.min, Vec2::splat(OVERLAY_ART));
+    let (left, width) = (cover.right() + 12.0, inner.right() - cover.right() - 52.0);
+    match &view.track {
+        Some(track) => {
+            artwork(ui, art, &track.cover, cover, 8.0);
+            let (title, byline) = (pos2(left, cover.center().y - 10.0), pos2(left, cover.center().y + 10.0));
+            label(ui, title, Align2::LEFT_CENTER, &track.title, medium(14.0), TEXT, width);
+            label(ui, byline, Align2::LEFT_CENTER, &track.subtitle, sans(12.5), MUTED, width);
         }
         None => {
-            ui.painter().rect_filled(art, 8.0, RAISED);
-            let at = pos2(left, art.center().y);
+            ui.painter().rect_filled(cover, 8.0, RAISED);
+            let at = pos2(left, cover.center().y);
             label(ui, at, Align2::LEFT_CENTER, "Nothing playing", medium(14.0), MUTED, width);
         }
     }
 
-    let (duration, position) = (app.player.duration_ms(), app.player.position_ms());
+    let (duration, position) = (view.duration_ms, view.position_ms);
     let played = if duration > 0 {
         (position as f32 / duration as f32).min(1.0)
     } else {
         0.0
     };
-    let bar = Rect::from_min_size(pos2(inner.left(), art.bottom() + 14.0), vec2(inner.width(), 4.0));
+    let bar = Rect::from_min_size(pos2(inner.left(), cover.bottom() + 14.0), vec2(inner.width(), 4.0));
     ui.painter().rect_filled(bar, 2.0, veil(0.16));
     ui.painter()
         .rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * played, bar.height())), 2.0, ACCENT);
@@ -755,7 +850,7 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     label(ui, end, Align2::RIGHT_CENTER, &clock(duration), sans(11.5), FAINT, 60.0);
 
     if controls {
-        overlay_controls(app, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
+        overlay_controls(view, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
     }
 
     if rows == 0 {
@@ -763,24 +858,23 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     }
     let heading = pos2(inner.left(), card.top() + overlay_base_height(controls) + 14.0);
     label(ui, heading, Align2::LEFT_CENTER, "Next up", bold(12.0), FAINT, inner.width());
-    for at in 0..rows {
-        let (index, item) = (upcoming + at, &app.saved.queue[upcoming + at]);
+    for (at, entry) in view.next_up.iter().enumerate() {
         let top = heading.y + 14.0 + at as f32 * OVERLAY_ROW;
         let slot = Rect::from_min_size(pos2(inner.left(), top), vec2(inner.width(), OVERLAY_ROW));
-        let response = ui.interact(slot, Id::new(("overlay-row", index)), Sense::click());
-        let (below, width) = queue_row(ui, app, item, slot.shrink2(vec2(0.0, 4.0)), hover_of(ui, &response));
-        label(ui, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
-        describe(&response, &item.title);
+        let response = ui.interact(slot, Id::new(("overlay-row", entry.index)), Sense::click());
+        let hover = hover_of(ui, &response);
+        let (below, width) = queue_row(ui, art, &entry.cover, &entry.title, slot.shrink2(vec2(0.0, 4.0)), hover, TEXT);
+        label(ui, below, Align2::LEFT_CENTER, &entry.subtitle, sans(12.5), MUTED, width);
+        describe(&response, &entry.title);
         if response.clicked() {
-            out.push(Action::Jump(index));
+            out.push(Action::Jump(entry.index));
         }
     }
 }
 
-fn overlay_controls(app: &App, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
-    let item = app.now_playing();
+fn overlay_controls(view: &OverlayView, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
     let around = |offset: f32, size: f32| Rect::from_center_size(middle + vec2(offset, 0.0), Vec2::splat(size));
-    let tone = if item.is_some() { TEXT } else { FAINT };
+    let tone = if view.track.is_some() { TEXT } else { FAINT };
     if icon_button(
         ui,
         around(-52.0, 36.0),
@@ -794,7 +888,7 @@ fn overlay_controls(app: &App, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
     {
         out.push(Action::Previous);
     }
-    let (symbol, hint) = if app.playing() {
+    let (symbol, hint) = if view.playing {
         (icon::PAUSE, "Pause")
     } else {
         (icon::PLAY, "Play")
@@ -835,8 +929,7 @@ fn label(ui: &Ui, at: Pos2, anchor: Align2, text: &str, font: FontId, color: Col
     rect
 }
 
-fn artist_spans(item: &Item) -> Vec<(Range<usize>, &str)> {
-    let subtitle = item.subtitle.as_str();
+fn artist_spans<'a>(item: &'a Item, subtitle: &str) -> Vec<(Range<usize>, &'a str)> {
     if item.artists.is_empty() && !item.artist_id.is_empty() {
         return vec![(0..subtitle.chars().count(), &item.artist_id)];
     }
@@ -854,27 +947,42 @@ fn artist_spans(item: &Item) -> Vec<(Range<usize>, &str)> {
     spans
 }
 
-fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos2, galley: &Arc<Galley>) {
+fn text_link(ui: &Ui, id: Id, rect: Rect, origin: Pos2, galley: &Arc<Galley>, hint: &str) -> bool {
+    let response = ui.interact(rect, id, Sense::click());
+    let hover = hover_of(ui, &response);
+    if hover > 0.0 {
+        ui.painter()
+            .with_clip_rect(rect)
+            .galley_with_override_text_color(origin, galley.clone(), MUTED.lerp_to_gamma(TEXT, hover));
+        let line = Stroke::new(1.0, TEXT.gamma_multiply(hover));
+        ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, line);
+    }
+    describe(&response, hint);
+    response.clicked()
+}
+
+fn span_rect(galley: &Galley, origin: Pos2, chars: Range<usize>) -> Rect {
+    let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
+    Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2() + galley.rect.min.to_vec2())
+}
+
+fn album_span(extra: &str, shown: usize) -> Option<Range<usize>> {
+    let total = extra.chars().count();
+    let start = extra.rfind(" • ").map_or(0, |at| extra[..at + " • ".len()].chars().count());
+    let visible = if shown < total { shown.saturating_sub(1) } else { total };
+    (start < visible).then_some(start..visible)
+}
+
+fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos2, galley: &Arc<Galley>, text: &str) {
     if item.is_artist {
         return;
     }
-    for (index, (chars, browse_id)) in artist_spans(item).into_iter().enumerate() {
-        let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
-        let rect = Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2() + galley.rect.min.to_vec2());
+    for (index, (chars, browse_id)) in artist_spans(item, text).into_iter().enumerate() {
+        let rect = span_rect(galley, origin, chars);
         if rect.width() < 1.0 {
             continue;
         }
-        let response = ui.interact(rect, id.with(index), Sense::click());
-        let hover = hover_of(ui, &response);
-        if hover > 0.0 {
-            ui.painter()
-                .with_clip_rect(rect)
-                .galley_with_override_text_color(origin, galley.clone(), MUTED.lerp_to_gamma(TEXT, hover));
-            let line = Stroke::new(1.0, TEXT.gamma_multiply(hover));
-            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, line);
-        }
-        describe(&response, "Go to artist");
-        if response.clicked() {
+        if text_link(ui, id.with(index), rect, origin, galley, "Go to artist") {
             out.push(Action::Go(Route::Browse(browse_id.to_owned())));
         }
     }
@@ -884,7 +992,7 @@ fn byline(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, at: Pos2, font: F
     let galley = fit(ui, &item.subtitle, font, MUTED, width, 1);
     let rect = Align2::LEFT_CENTER.anchor_size(at, galley.size());
     ui.painter().galley(rect.min, galley.clone(), MUTED);
-    artist_links(ui, out, item, id, rect.min, &galley);
+    artist_links(ui, out, item, id, rect.min, &galley, &item.subtitle);
     rect
 }
 
@@ -1204,15 +1312,17 @@ fn track_row(ui: &mut Ui, cx: &mut Cx, items: &[Item], index: usize, number: Opt
     }
     if rect.width() > 700.0 && !item.extra.is_empty() {
         let column = rect.width() * 0.26;
-        label(
-            ui,
-            pos2(right - column, mid),
-            Align2::LEFT_CENTER,
-            &item.extra,
-            sans(13.0),
-            MUTED,
-            column - 12.0,
-        );
+        let galley = fit(ui, &item.extra, sans(13.0), MUTED, column - 12.0, 1);
+        let album = Align2::LEFT_CENTER.anchor_size(pos2(right - column, mid), galley.size());
+        ui.painter().galley(album.min, galley.clone(), MUTED);
+        let shown = galley.rows.iter().map(|row| row.char_count_excluding_newline()).sum();
+        let span = album_span(&item.extra, shown).filter(|_| !item.album_id.is_empty() && !item.is_artist);
+        if let Some(span) = span {
+            let name = span_rect(&galley, album.min, span);
+            if text_link(ui, response.id.with("album"), name, album.min, &galley, "Go to album") {
+                cx.out.push(Action::Go(Route::Browse(item.album_id.clone())));
+            }
+        }
         right -= column + 20.0;
     }
 
@@ -1487,9 +1597,14 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
     }
     bottom -= 60.0;
 
-    for (text, font, color) in [(&item.subtitle, sans(14.0), MUTED), (&item.extra, medium(15.0), TEXT)] {
+    for (text, font, color, linked) in [(&item.subtitle, sans(14.0), MUTED, false), (&item.extra, medium(15.0), TEXT, true)] {
         if !text.is_empty() {
-            let line = label(ui, pos2(left, bottom), Align2::LEFT_BOTTOM, text, font, color, width);
+            let galley = fit(ui, text, font, color, width, 1);
+            let line = Align2::LEFT_BOTTOM.anchor_size(pos2(left, bottom), galley.size());
+            ui.painter().galley(line.min, galley.clone(), color);
+            if linked {
+                artist_links(ui, cx.out, item, ui.id().with("hero-artist"), line.min, &galley, text);
+            }
             bottom = line.top() - 5.0;
         }
     }
@@ -2197,7 +2312,8 @@ fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, ena
 fn overlay_unavailable() -> Option<&'static str> {
     let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
     let on_wayland = cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11;
-    on_wayland.then_some("Wayland does not let apps stay on top of other windows, so the overlay needs an X11 session")
+    (on_wayland && !hotkeys::layer_overlay())
+        .then_some("This desktop does not let apps stay on top of other windows on Wayland, so the overlay is not available here")
 }
 
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
@@ -2686,7 +2802,7 @@ fn browser_tile(ui: &Ui, at: Pos2, width: f32, name: &str, last_used: bool) -> R
 fn logo_bytes(name: &str) -> Option<&'static [u8]> {
     Some(match name {
         "Chrome" => include_bytes!("../assets/browsers/chrome.png"),
-        "Brave" => include_bytes!("../assets/browsers/brave.png"),
+        "Brave" | "Brave Origin" => include_bytes!("../assets/browsers/brave.png"),
         "Opera GX" => include_bytes!("../assets/browsers/operagx.png"),
         "Firefox" => include_bytes!("../assets/browsers/firefox.png"),
         "LibreWolf" => include_bytes!("../assets/browsers/librewolf.png"),
@@ -2729,45 +2845,66 @@ fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let haze = Rect::from_min_size(area.min, vec2(area.width(), AMBIENT_HEIGHT.min(area.height())));
     wash(ui.painter(), haze, glow, PANEL);
     ui.painter().vline(area.left() + 0.5, area.y_range(), Stroke::new(1.0, veil(0.06)));
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+    let Some(item) = app.now_playing() else {
         Frame::new().inner_margin(Margin::same(20)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let Some(item) = app.now_playing() else {
-                message(
-                    ui,
-                    icon::VINYL_RECORD,
-                    "Nothing playing",
-                    "Pick a song and the queue lines up here.",
-                );
-                return;
-            };
-            eyebrow(ui, "Now playing", 0.0);
-            let (head, cover) = ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ART), Sense::click());
-            let art = Rect::from_min_size(head.min, Vec2::splat(QUEUE_ART));
-            artwork(ui, &app.art, app.saved.covers.of(item), art, ART_RADIUS);
-            let lift = hover_of(ui, &cover);
-            ui.painter().rect_filled(art, ART_RADIUS, shade(0.4 * lift));
-            ui.painter().text(
-                art.center(),
-                Align2::CENTER_CENTER,
-                icon::ARROWS_OUT_SIMPLE,
-                glyph(22.0),
-                TEXT.gamma_multiply(lift),
+            message(
+                ui,
+                icon::VINYL_RECORD,
+                "Nothing playing",
+                "Pick a song and the queue lines up here.",
             );
-            describe(&cover, "Now playing");
-            if cover.clicked() {
-                out.push(Action::Expand(true));
-            }
-            let left = art.right() + 14.0;
-            let title = fit(ui, &item.title, bold(15.5), TEXT, head.right() - left, 2);
-            let top = head.center().y - (title.size().y + 22.0) / 2.0;
-            let below = pos2(left, top + title.size().y + 12.0);
-            ui.painter().galley(pos2(left, top), title, TEXT);
-            byline(ui, out, item, Id::new("queue-artist"), below, sans(13.0), head.right() - left);
-            ui.add_space(26.0);
-            queue_rows(app, ui, true, out);
         });
+        return;
+    };
+    let header = Margin {
+        left: 20,
+        right: 20,
+        top: 20,
+        bottom: 0,
+    };
+    Frame::new().inner_margin(header).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        eyebrow(ui, "Now playing", 0.0);
+        let (head, cover) = ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ART), Sense::click());
+        let art = Rect::from_min_size(head.min, Vec2::splat(QUEUE_ART));
+        artwork(ui, &app.art, app.saved.covers.of(item), art, ART_RADIUS);
+        let lift = hover_of(ui, &cover);
+        ui.painter().rect_filled(art, ART_RADIUS, shade(0.4 * lift));
+        ui.painter().text(
+            art.center(),
+            Align2::CENTER_CENTER,
+            icon::ARROWS_OUT_SIMPLE,
+            glyph(22.0),
+            TEXT.gamma_multiply(lift),
+        );
+        describe(&cover, "Now playing");
+        if cover.clicked() {
+            out.push(Action::Expand(true));
+        }
+        let left = art.right() + 14.0;
+        let title = fit(ui, &item.title, bold(15.5), TEXT, head.right() - left, 2);
+        let top = head.center().y - (title.size().y + 22.0) / 2.0;
+        let below = pos2(left, top + title.size().y + 12.0);
+        ui.painter().galley(pos2(left, top), title, TEXT);
+        byline(ui, out, item, Id::new("queue-artist"), below, sans(13.0), head.right() - left);
     });
+    ui.add_space(26.0);
+    let rows = Margin {
+        left: 20,
+        right: 20,
+        top: 0,
+        bottom: 20,
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("queue-rows")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            Frame::new().inner_margin(rows).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                queue_rows(app, ui, true, out);
+            });
+        });
 }
 
 fn tab(ui: &Ui, at: Pos2, text: &str, active: bool) -> Response {
@@ -2873,19 +3010,19 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     }
 }
 
-fn queue_row(ui: &Ui, app: &App, item: &Item, slot: Rect, hover: f32) -> (Pos2, f32) {
+fn queue_row(ui: &Ui, art: &Art, cover: &str, title: &str, slot: Rect, hover: f32, ink: Color32) -> (Pos2, f32) {
     ui.painter()
         .rect_filled(slot.expand2(vec2(8.0, 0.0)), ROW_RADIUS, veil(0.06 * hover));
-    let art = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
-    artwork(ui, &app.art, app.saved.covers.of(item), art, 5.0);
-    let (left, width) = (art.right() + 12.0, slot.right() - art.right() - 44.0);
+    let frame = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
+    artwork(ui, art, cover, frame, 5.0);
+    let (left, width) = (frame.right() + 12.0, slot.right() - frame.right() - 44.0);
     label(
         ui,
         pos2(left, slot.center().y - 9.0),
         Align2::LEFT_CENTER,
-        &item.title,
+        title,
         medium(13.5),
-        TEXT,
+        ink,
         width,
     );
     (pos2(left, slot.center().y + 9.0), width)
@@ -2893,47 +3030,73 @@ fn queue_row(ui: &Ui, app: &App, item: &Item, slot: Rect, hover: f32) -> (Pos2, 
 
 fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> bool {
     let queue = &app.saved.queue;
-    let upcoming = app.saved.current.map_or(0, |current| current + 1);
-    if upcoming >= queue.len() {
+    if queue.is_empty() {
         return false;
     }
+    let current = app.saved.current.filter(|current| *current < queue.len());
+    let upcoming = current.map_or(0, |current| current + 1);
     if heading {
-        eyebrow(ui, "Next up", 0.0);
+        eyebrow(ui, "Queue", 0.0);
     }
-    let top = ui.cursor().top();
     let pointer = ui.ctx().pointer_interact_pos();
     let grab = Id::new("queue-grab");
-    let rows: Vec<(Rect, Response)> = (upcoming..queue.len())
-        .map(|_| ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ROW), Sense::click_and_drag()))
+    let rows: Vec<(Rect, Response)> = (0..queue.len())
+        .map(|index| {
+            let sense = if index >= upcoming {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            };
+            ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ROW), sense)
+        })
         .collect();
+    if let Some(current) = current {
+        let seen = Id::new(("queue-scrolled", heading));
+        let playing = &queue[current].video_id;
+        if ui.data(|data| data.get_temp::<String>(seen)).as_ref() != Some(playing) {
+            ui.data_mut(|data| data.insert_temp(seen, playing.clone()));
+            ui.scroll_to_rect(rows[current].0, Some(Align::TOP));
+        }
+    }
     let carried = rows.iter().position(|(_, row)| row.dragged() || row.drag_stopped());
     if let (Some((slot, _)), Some(pointer)) = (rows.iter().find(|(_, row)| row.drag_started()), pointer) {
         ui.data_mut(|data| data.insert_temp(grab, pointer.y - slot.top()));
     }
     let held = ui.data(|data| data.get_temp::<f32>(grab)).unwrap_or(QUEUE_ROW / 2.0);
-    let moving = carried.zip(pointer).map(|(from, pointer)| {
+    let moving = carried.zip(pointer).filter(|_| upcoming < queue.len()).map(|(from, pointer)| {
         let lifted = pointer.y - held;
-        let over = ((lifted + QUEUE_ROW / 2.0 - top) / QUEUE_ROW).floor().max(0.0) as usize;
-        (from, over.min(rows.len() - 1), lifted)
+        let first = rows[upcoming].0.top();
+        let over = ((lifted + QUEUE_ROW / 2.0 - first) / QUEUE_ROW).floor().max(0.0) as usize;
+        (from, (upcoming + over).min(rows.len() - 1), lifted)
     });
     let glide = if moving.is_some() { 0.12 } else { 0.0 };
-    for (at, (slot, response)) in rows.iter().enumerate() {
-        let (index, item) = (upcoming + at, &queue[upcoming + at]);
+    for (index, (slot, response)) in rows.iter().enumerate() {
+        let item = &queue[index];
         let aside = match moving {
-            Some((from, to, _)) if from < at && at <= to => -QUEUE_ROW,
-            Some((from, to, _)) if to <= at && at < from => QUEUE_ROW,
+            Some((from, to, _)) if from < index && index <= to => -QUEUE_ROW,
+            Some((from, to, _)) if to <= index && index < from => QUEUE_ROW,
             _ => 0.0,
         };
         let aside = ui.ctx().animate_value_with_time(response.id.with("aside"), aside, glide);
         let slot = slot.translate(vec2(0.0, aside));
-        if moving.is_some_and(|(from, ..)| from == at) || !ui.is_rect_visible(slot) {
+        if moving.is_some_and(|(from, ..)| from == index) || !ui.is_rect_visible(slot) {
             continue;
         }
         let hover = hover_of(ui, response);
-        let (below, width) = queue_row(ui, app, item, slot, hover);
-        byline(ui, out, item, response.id.with("artist"), below, sans(12.5), width);
+        let is_current = current == Some(index);
+        let mut row = ui.new_child(UiBuilder::new().id_salt(index).max_rect(slot));
+        if index < upcoming && !is_current {
+            row.set_opacity(0.55);
+        }
+        if is_current {
+            ui.painter()
+                .rect_filled(slot.expand2(vec2(8.0, 0.0)), ROW_RADIUS, ACCENT.gamma_multiply(0.14 + 0.08 * hover));
+        }
+        let ink = if is_current { ACCENT } else { TEXT };
+        let (below, width) = queue_row(&row, &app.art, app.saved.covers.of(item), &item.title, slot, hover, ink);
+        byline(&row, out, item, response.id.with("artist"), below, sans(12.5), width);
         describe(response, &item.title);
-        if hover > 0.0 {
+        if hover > 0.0 && !is_current {
             let close = Rect::from_center_size(pos2(slot.right() - 12.0, slot.center().y), Vec2::splat(28.0));
             let tone = MUTED.gamma_multiply(hover);
             if icon_button(
@@ -2950,7 +3113,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
                 out.push(Action::Remove(index));
             }
         }
-        if response.clicked() {
+        if response.clicked() && !is_current {
             out.push(Action::Jump(index));
         }
     }
@@ -2959,7 +3122,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
     let (slot, response) = &rows[from];
     if response.drag_stopped() {
         let gap = if to > from { to + 1 } else { to };
-        out.push(Action::Move(upcoming + from, upcoming + gap));
+        out.push(Action::Move(from, gap));
         return true;
     }
     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -2975,8 +3138,8 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
     };
     ghost.painter().add(shadow.as_shape(plate, ROW_RADIUS));
     ghost.painter().rect_filled(plate, ROW_RADIUS, FLOATING);
-    let item = &queue[upcoming + from];
-    let (below, width) = queue_row(&ghost, app, item, lifted, 0.0);
+    let item = &queue[from];
+    let (below, width) = queue_row(&ghost, &app.art, app.saved.covers.of(item), &item.title, lifted, 0.0, TEXT);
     label(&ghost, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
     true
 }
@@ -3044,7 +3207,7 @@ fn now_playing(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Color32 {
     ui.painter().galley(pos2(stage.center().x, below), title, TEXT);
     let origin = pos2(stage.center().x, lower);
     ui.painter().galley(origin, artist.clone(), MUTED);
-    artist_links(ui, out, item, Id::new("stage-artist"), origin, &artist);
+    artist_links(ui, out, item, Id::new("stage-artist"), origin, &artist, &item.subtitle);
 
     let card = Rect::from_min_max(
         pos2(stage.right(), area.top() + 24.0),
@@ -3053,7 +3216,7 @@ fn now_playing(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Color32 {
     ui.painter().rect_filled(card, 18.0, shade(0.24));
     let lyrics = app.saved.lyrics_open;
     let mut at = card.min + vec2(14.0, 14.0);
-    for (text, shows_lyrics) in [("Next up", false), ("Lyrics", true)] {
+    for (text, shows_lyrics) in [("Queue", false), ("Lyrics", true)] {
         let tab = tab(ui, at, text, lyrics == shows_lyrics);
         if tab.clicked() {
             out.push(Action::ShowLyrics(shows_lyrics));
@@ -3486,6 +3649,16 @@ mod tests {
     }
 
     #[test]
+    fn links_only_the_album_name_at_the_end_of_the_extra_column() {
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 24), Some(13..24));
+        assert_eq!(album_span("Adımı Kalbine Yaz", 17), Some(0..17));
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 18), Some(13..17));
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 13), None);
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 8), None);
+        assert_eq!(album_span("", 0), None);
+    }
+
+    #[test]
     fn links_each_artist_name_to_its_own_page() {
         let credit = |name: &str, id: &str| (name.to_owned(), id.to_owned());
         let mut song = Item {
@@ -3497,15 +3670,16 @@ mod tests {
             ],
             ..Item::default()
         };
-        assert_eq!(artist_spans(&song), [(0..11, "UC1"), (13..21, "UC2"), (24..38, "UC3")]);
+        let line = song.subtitle.clone();
+        assert_eq!(artist_spans(&song, &line), [(0..11, "UC1"), (13..21, "UC2"), (24..38, "UC3")]);
 
         song.artists = vec![credit("Çağrı Sinci Jr", "UC3"), credit("Şehinşah", "UC2"), credit("Nobody", "UC9")];
-        assert_eq!(artist_spans(&song), [(24..38, "UC3"), (13..21, "UC2")]);
+        assert_eq!(artist_spans(&song, &line), [(24..38, "UC3"), (13..21, "UC2")]);
 
         song.artists.clear();
-        assert!(artist_spans(&song).is_empty());
+        assert!(artist_spans(&song, &line).is_empty());
         song.artist_id = "UC1".to_owned();
-        assert_eq!(artist_spans(&song), [(0..51, "UC1")]);
+        assert_eq!(artist_spans(&song, &line), [(0..51, "UC1")]);
     }
 
     #[test]

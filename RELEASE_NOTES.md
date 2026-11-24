@@ -2,18 +2,20 @@
 - Audio diagnostics now record buffering, stream, decoder and device delays to help investigate playback stutters
 - Settings can send Tubefast to the system tray when you close the window, now also on macOS and Linux
 - Global hotkeys now also work on macOS and on Linux, with X11 or with Wayland through the desktop's shortcuts portal, where the keys are set in the system settings. If your desktop has no shortcuts portal, Settings now tells you
-- The media overlay now also works on macOS and on Linux with X11. On Wayland it is not available
+- The media overlay now also works on macOS and on Linux with X11 or Wayland desktops that support layer shell. On Wayland without layer shell, Settings says it is unavailable
 - Updating from inside Tubefast now also works on Linux (AppImage or a binary in a folder you can write to) and on macOS
-- Sign in with Firefox, LibreWolf, Zen, Waterfox or Floorp as well as Chrome, Edge, Brave and Opera GX. With more than one browser installed, Continue in browser lets you pick one and remembers it. Firefox installed as a snap on Linux now works too
+- Sign in with Firefox, LibreWolf, Zen, Waterfox or Floorp as well as Chrome, Edge, Brave, Brave Origin, Helium and Opera GX. With more than one browser installed, Continue in browser lets you pick one and remembers it. Firefox installed as a snap on Linux now works too
 - Your sign-in now keeps up with the cookies YouTube refreshes, which should stop the random sign-outs. Pasted cookies are checked for the session cookies they need, and the paste steps and the expired sign-in message are clearer
 - Your account is now restored at startup even if Tubefast was closed abruptly
-- On Linux Wayland, clicking the tray entry brings the window back
+- On Linux Wayland, closing the window to the tray now really hides it while music plays, clicking the tray entry brings it back, Quit works while minimized, and desktops without a tray make the close button quit as usual
 - On Linux, the window title now shows and the window no longer opens larger than your screen
 - A song that stalls or fails to load now retries and resumes from the same spot. The play button shows when it is buffering and offers a retry if it gives up
 - On Linux, the song artist and volume changes from the desktop now show up correctly in media controls
-- In narrow windows the queue now takes the place of the main content
+- In narrow windows the queue now takes the place of the main content, and the queue panel shows the whole queue, including songs that already played, so you can jump to any song
 - Artwork requests stay bounded while you browse large libraries
 - Changing tracks stops stream lookups that are no longer needed
 - Browse podcast shows and play their episodes from the Podcasts sidebar entry
 - Unavailable videos are skipped without skipping songs for connection or sign-in failures
 - Podcasts and videos play their original audio instead of an automatically dubbed language
+- Turning shuffle off puts the queue back in its normal order
+- Album names on an artist page open the album, and the artist name on an album page opens the artist
