@@ -1,11 +1,11 @@
 use crate::opus::OpusStream;
 use crate::ytm;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::errors::Error as DecodeError;
@@ -34,6 +34,177 @@ const LOAD_RETRIES: u32 = 3;
 const STALL_AFTER: Duration = Duration::from_millis(700);
 const RECOVERED_AFTER_MS: u64 = 5000;
 const NO_OUTPUT: &str = "No audio output device was found";
+const AUDIO_LOG: &str = "audio.log";
+const AUDIO_LOG_BYTES: u64 = 512 * 1024;
+const DIAGNOSTIC_EVENTS: usize = 256;
+const NETWORK_WAIT_LOG_MS: u64 = 25;
+const PACKET_WAIT_LOG_MS: u64 = 25;
+const DECODE_WAIT_LOG_MS: u64 = 10;
+const AUDIO_LATE_LOG_MS: u64 = 25;
+const SCHEDULER_HEARTBEAT: Duration = Duration::from_millis(100);
+const SCHEDULER_LATE_LOG_MS: u64 = 150;
+const AUDIO_HEALTH_EVERY: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct AudioDiagnostics {
+    events: SyncSender<(u64, Diagnostic)>,
+    started: Instant,
+}
+
+#[derive(Debug)]
+enum Diagnostic {
+    Session,
+    TrackLoad {
+        video_id: String,
+    },
+    TrackOpened {
+        video_id: String,
+    },
+    AudioHealth {
+        queue: u32,
+        position_ms: u64,
+        buffered: u32,
+        rate: u32,
+        channels: u16,
+        paused: bool,
+    },
+    NetworkWait {
+        elapsed_ms: u64,
+    },
+    PacketWait {
+        elapsed_ms: u64,
+        queue: u32,
+    },
+    DecodeWait {
+        elapsed_ms: u64,
+        queue: u32,
+    },
+    AudioLate {
+        late_ms: u64,
+        queue: u32,
+    },
+    QueueStarved {
+        queue: u32,
+    },
+    QueueRecovered {
+        queue: u32,
+        elapsed_ms: u64,
+    },
+    DeviceError(String),
+}
+
+impl AudioDiagnostics {
+    fn start() -> Option<Self> {
+        let folder = eframe::storage_dir(crate::app_id())?;
+        let file = folder.join(AUDIO_LOG);
+        let grown = std::fs::metadata(&file).is_ok_and(|log| log.len() > AUDIO_LOG_BYTES);
+        std::fs::create_dir_all(&folder).ok()?;
+        let (events, inbox) = mpsc::sync_channel(DIAGNOSTIC_EVENTS);
+        std::thread::spawn(move || {
+            let Ok(log) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(!grown)
+                .write(true)
+                .truncate(grown)
+                .open(file)
+            else {
+                return;
+            };
+            let mut log = std::io::BufWriter::new(log);
+            let mut lines = 0u64;
+            let mut heartbeat = Instant::now();
+            loop {
+                let received = inbox.recv_timeout(SCHEDULER_HEARTBEAT);
+                let heartbeat_ms = heartbeat.elapsed().as_millis() as u64;
+                if heartbeat_ms >= SCHEDULER_LATE_LOG_MS {
+                    let elapsed_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_millis());
+                    let _ = writeln!(log, "unix_ms={elapsed_ms} scheduler_late elapsed_ms={heartbeat_ms}");
+                    let _ = log.flush();
+                    lines += 1;
+                    if lines.is_multiple_of(128) && log.get_ref().metadata().is_ok_and(|metadata| metadata.len() > AUDIO_LOG_BYTES) {
+                        let _ = log.flush();
+                        let _ = log.get_mut().set_len(0);
+                        let _ = log.get_mut().seek(SeekFrom::Start(0));
+                    }
+                }
+                heartbeat = Instant::now();
+                let (elapsed_ms, event) = match received {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+                let message = match event {
+                    Diagnostic::Session => format!("session version={} platform={}", crate::VERSION, std::env::consts::OS),
+                    Diagnostic::TrackLoad { video_id } => format!("track_load video_id={video_id}"),
+                    Diagnostic::TrackOpened { video_id } => format!("track_opened video_id={video_id}"),
+                    Diagnostic::AudioHealth {
+                        queue,
+                        position_ms,
+                        buffered,
+                        rate,
+                        channels,
+                        paused,
+                    } => format!(
+                        "audio_health queue={queue} position_ms={position_ms} buffered={buffered} rate={rate} channels={channels} paused={paused}"
+                    ),
+                    Diagnostic::NetworkWait { elapsed_ms } => format!("network_wait elapsed_ms={elapsed_ms}"),
+                    Diagnostic::PacketWait { elapsed_ms, queue } => {
+                        format!("packet_wait elapsed_ms={elapsed_ms} queue={queue}")
+                    }
+                    Diagnostic::DecodeWait { elapsed_ms, queue } => {
+                        format!("decode_wait elapsed_ms={elapsed_ms} queue={queue}")
+                    }
+                    Diagnostic::AudioLate { late_ms, queue } => format!("audio_late late_ms={late_ms} queue={queue}"),
+                    Diagnostic::QueueStarved { queue } => format!("queue_starved queue={queue}"),
+                    Diagnostic::QueueRecovered {
+                        queue,
+                        elapsed_ms: stalled,
+                    } => {
+                        format!("queue_recovered stalled_ms={stalled} queue={queue}")
+                    }
+                    Diagnostic::DeviceError(message) => format!("device_error message={message:?}"),
+                };
+                let unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis());
+                if writeln!(log, "unix_ms={unix_ms} since_start_ms={elapsed_ms} {message}").is_ok() {
+                    let _ = log.flush();
+                }
+                lines += 1;
+                if lines.is_multiple_of(128) && log.get_ref().metadata().is_ok_and(|metadata| metadata.len() > AUDIO_LOG_BYTES) {
+                    let _ = log.flush();
+                    let _ = log.get_mut().set_len(0);
+                    let _ = log.get_mut().seek(SeekFrom::Start(0));
+                }
+            }
+        });
+        let diagnostics = Self {
+            events,
+            started: Instant::now(),
+        };
+        diagnostics.record(Diagnostic::Session);
+        Some(diagnostics)
+    }
+
+    fn record(&self, event: Diagnostic) {
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let _ = self.events.try_send((elapsed_ms, event));
+    }
+
+    #[cfg(test)]
+    fn channel() -> (Self, Receiver<(u64, Diagnostic)>) {
+        let (events, inbox) = mpsc::sync_channel(DIAGNOSTIC_EVENTS);
+        (
+            Self {
+                events,
+                started: Instant::now(),
+            },
+            inbox,
+        )
+    }
+}
 
 fn retry_delay(retry: u32) -> Option<Duration> {
     (1..=LOAD_RETRIES).contains(&retry).then(|| Duration::from_secs(1 << (retry - 1)))
@@ -50,6 +221,8 @@ struct Shared {
     position_ms: AtomicU64,
     duration_ms: AtomicU64,
     buffered: AtomicU32,
+    queued: AtomicU32,
+    pause_epoch: AtomicU64,
     loading: AtomicBool,
     buffering: AtomicBool,
     paused: AtomicBool,
@@ -107,10 +280,18 @@ struct Fetch {
     cancelled: AtomicBool,
     generation: u64,
     shared: Arc<Shared>,
+    diagnostics: Option<AudioDiagnostics>,
 }
 
 impl Fetch {
-    fn start(yt: &ytm::Client, url: String, len: u64, generation: u64, shared: Arc<Shared>) -> Arc<Fetch> {
+    fn start(
+        yt: &ytm::Client,
+        url: String,
+        len: u64,
+        generation: u64,
+        shared: Arc<Shared>,
+        diagnostics: Option<AudioDiagnostics>,
+    ) -> Arc<Fetch> {
         let (agent, user_agent) = (yt.agent.clone(), yt.player_agent());
         let window = Window {
             bytes: VecDeque::with_capacity(len.min(WINDOW_BYTES) as usize),
@@ -124,6 +305,7 @@ impl Fetch {
             cancelled: AtomicBool::new(false),
             generation,
             shared,
+            diagnostics,
         });
         let worker = fetch.clone();
         std::thread::spawn(move || {
@@ -215,6 +397,7 @@ impl Drop for Reader {
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let mut window = self.fetch.window.lock().unwrap();
+        let mut waiting: Option<Instant> = None;
         loop {
             window.reader = self.at;
             if self.at >= window.start && self.at < window.end() {
@@ -227,6 +410,12 @@ impl Read for Reader {
                 self.at += count as u64;
                 window.reader = self.at;
                 drop(window);
+                if let (Some(waiting), Some(diagnostics)) = (waiting, &self.fetch.diagnostics) {
+                    let elapsed_ms = waiting.elapsed().as_millis() as u64;
+                    if elapsed_ms >= NETWORK_WAIT_LOG_MS {
+                        diagnostics.record(Diagnostic::NetworkWait { elapsed_ms });
+                    }
+                }
                 self.fetch.changed.notify_all();
                 return Ok(count);
             }
@@ -239,6 +428,7 @@ impl Read for Reader {
             if self.fetch.failed.load(Relaxed) {
                 return Err(io::Error::other("The connection was lost while streaming"));
             }
+            waiting.get_or_insert_with(Instant::now);
             self.fetch.changed.notify_all();
             window = self.fetch.changed.wait_timeout(window, WINDOW_POLL).unwrap().0;
         }
@@ -277,11 +467,13 @@ struct Track {
     buffer: Option<SampleBuffer<f32>>,
     trim_ms: Option<u64>,
     finished: bool,
+    shared: Arc<Shared>,
+    diagnostics: Option<AudioDiagnostics>,
 }
 
 impl Track {
     fn open(yt: &ytm::Client, urls: &Urls, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
-        Self::open_if(yt, urls, video_id, generation, shared, &|| true)
+        Self::open_if(yt, urls, video_id, generation, shared, None, &|| true)
             .map_err(|error| error.message)?
             .ok_or_else(|| "Stream resolution was cancelled".to_owned())
     }
@@ -292,6 +484,7 @@ impl Track {
         video_id: &str,
         generation: u64,
         shared: &Arc<Shared>,
+        diagnostics: Option<AudioDiagnostics>,
         current: &impl Fn() -> bool,
     ) -> Result<Option<Track>, ytm::StreamError> {
         let Some(mut stream) = resolve_if(yt, urls, video_id, current)? else {
@@ -301,12 +494,12 @@ impl Track {
             return Ok(None);
         }
         let fallback = stream.fallback.take();
-        match Self::open_stream(yt, stream, video_id, generation, shared) {
+        match Self::open_stream(yt, stream, video_id, generation, shared, diagnostics.clone()) {
             Ok(track) if current() => Ok(Some(track)),
             Ok(_) => Ok(None),
             Err(_) if !current() => Ok(None),
             Err(message) => match fallback {
-                Some(aac) if current() => Self::open_stream(yt, *aac, video_id, generation, shared)
+                Some(aac) if current() => Self::open_stream(yt, *aac, video_id, generation, shared, diagnostics)
                     .map(Some)
                     .map_err(Into::into),
                 Some(_) => Ok(None),
@@ -315,7 +508,14 @@ impl Track {
         }
     }
 
-    fn open_stream(yt: &ytm::Client, stream: ytm::Stream, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
+    fn open_stream(
+        yt: &ytm::Client,
+        stream: ytm::Stream,
+        video_id: &str,
+        generation: u64,
+        shared: &Arc<Shared>,
+        diagnostics: Option<AudioDiagnostics>,
+    ) -> Result<Track, String> {
         let ytm::Stream {
             url,
             len,
@@ -327,7 +527,7 @@ impl Track {
             shared.duration_ms.store(duration_ms, Relaxed);
         }
         let seekable = Arc::new(AtomicBool::new(false));
-        let fetch = Fetch::start(yt, url, len, generation, shared.clone());
+        let fetch = Fetch::start(yt, url, len, generation, shared.clone(), diagnostics.clone());
         let reader = Reader {
             fetch,
             at: 0,
@@ -361,24 +561,46 @@ impl Track {
             buffer: None,
             trim_ms: None,
             finished: false,
+            shared: shared.clone(),
+            diagnostics,
         })
     }
 
     fn next_chunk(&mut self, epoch: u64) -> Result<Option<Chunk>, String> {
         loop {
+            let packet_started = Instant::now();
             let packet = match self.format.next_packet() {
                 Ok(packet) => packet,
                 Err(DecodeError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(e) => return Err(e.to_string()),
             };
+            let packet_ms = packet_started.elapsed().as_millis() as u64;
+            if packet_ms >= PACKET_WAIT_LOG_MS
+                && let Some(diagnostics) = &self.diagnostics
+            {
+                diagnostics.record(Diagnostic::PacketWait {
+                    elapsed_ms: packet_ms,
+                    queue: self.shared.queued.load(Relaxed),
+                });
+            }
             if packet.track_id() != self.id {
                 continue;
             }
+            let decode_started = Instant::now();
             let decoded = match self.decoder.decode(&packet) {
                 Ok(decoded) => decoded,
                 Err(DecodeError::DecodeError(_)) => continue,
                 Err(e) => return Err(e.to_string()),
             };
+            let decode_ms = decode_started.elapsed().as_millis() as u64;
+            if decode_ms >= DECODE_WAIT_LOG_MS
+                && let Some(diagnostics) = &self.diagnostics
+            {
+                diagnostics.record(Diagnostic::DecodeWait {
+                    elapsed_ms: decode_ms,
+                    queue: self.shared.queued.load(Relaxed),
+                });
+            }
             let spec = *decoded.spec();
             let channels = spec.channels.count();
             let buffer = match &mut self.buffer {
@@ -466,12 +688,18 @@ struct PcmSource {
     rate: u32,
     channels: u16,
     starved: Option<Instant>,
+    health_at: Instant,
+    refill_at: Option<Instant>,
+    deadline_balance_ms: i64,
+    deadline_reported: bool,
+    pause_epoch: u64,
     shared: Arc<Shared>,
     wake: Wake,
+    diagnostics: Option<AudioDiagnostics>,
 }
 
 impl PcmSource {
-    fn new(chunks: Chunks, shared: Arc<Shared>, wake: Wake) -> Self {
+    fn new(chunks: Chunks, shared: Arc<Shared>, wake: Wake, diagnostics: Option<AudioDiagnostics>) -> Self {
         Self {
             chunks,
             samples: vec![0.0; SILENCE_SAMPLES],
@@ -479,19 +707,35 @@ impl PcmSource {
             rate: 44_100,
             channels: 2,
             starved: None,
+            health_at: Instant::now(),
+            refill_at: None,
+            deadline_balance_ms: 0,
+            deadline_reported: false,
+            pause_epoch: shared.pause_epoch.load(Relaxed),
             shared,
             wake,
+            diagnostics,
         }
     }
 
     fn refill(&mut self) {
+        self.observe_deadline();
+        self.record_health();
         self.at = 0;
-        while let Ok(chunk) = self.chunks.lock().unwrap().try_recv() {
+        loop {
+            let chunk = {
+                let chunks = self.chunks.lock().unwrap();
+                chunks.try_recv().ok()
+            };
+            let Some(chunk) = chunk else { break };
+            if self.shared.queued.load(Relaxed) > 0 {
+                self.shared.queued.fetch_sub(1, Relaxed);
+            }
             if chunk.epoch != self.shared.epoch.load(Relaxed) {
                 continue;
             }
             if chunk.end {
-                self.starved = None;
+                self.recovered();
                 self.shared.buffering.store(false, Relaxed);
                 self.shared.ended.store(true, Relaxed);
                 (self.wake)();
@@ -500,7 +744,7 @@ impl PcmSource {
             if chunk.samples.is_empty() {
                 continue;
             }
-            self.starved = None;
+            self.recovered();
             self.shared.buffering.store(false, Relaxed);
             self.shared.position_ms.store(chunk.start_ms, Relaxed);
             self.rate = chunk.rate;
@@ -510,10 +754,70 @@ impl PcmSource {
         }
         self.samples.clear();
         self.samples.resize(SILENCE_SAMPLES, 0.0);
+        let first_empty = self.starved.is_none();
         let since = *self.starved.get_or_insert_with(Instant::now);
+        if first_empty && let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(Diagnostic::QueueStarved {
+                queue: self.shared.queued.load(Relaxed),
+            });
+        }
         if since.elapsed() >= STALL_AFTER && !self.shared.paused.load(Relaxed) && !self.shared.buffering.swap(true, Relaxed) {
             (self.wake)();
         }
+    }
+
+    fn record_health(&mut self) {
+        if self.health_at.elapsed() < AUDIO_HEALTH_EVERY {
+            return;
+        }
+        self.health_at = Instant::now();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(Diagnostic::AudioHealth {
+                queue: self.shared.queued.load(Relaxed),
+                position_ms: self.shared.position_ms.load(Relaxed),
+                buffered: self.shared.buffered.load(Relaxed),
+                rate: self.rate,
+                channels: self.channels,
+                paused: self.shared.paused.load(Relaxed),
+            });
+        }
+    }
+
+    fn recovered(&mut self) {
+        if let Some(starved) = self.starved.take()
+            && let Some(diagnostics) = &self.diagnostics
+        {
+            diagnostics.record(Diagnostic::QueueRecovered {
+                queue: self.shared.queued.load(Relaxed),
+                elapsed_ms: starved.elapsed().as_millis() as u64,
+            });
+        }
+    }
+
+    fn observe_deadline(&mut self) {
+        let now = Instant::now();
+        let pause_epoch = self.shared.pause_epoch.load(Relaxed);
+        if pause_epoch != self.pause_epoch {
+            self.deadline_balance_ms = 0;
+            self.deadline_reported = false;
+        } else if let Some(previous) = self.refill_at {
+            let expected_ms = self.samples.len() as u64 * 1000 / self.channels.max(1) as u64 / self.rate.max(1) as u64;
+            let actual_ms = now.duration_since(previous).as_millis() as u64;
+            self.deadline_balance_ms += actual_ms as i64 - expected_ms as i64;
+            if self.deadline_balance_ms >= AUDIO_LATE_LOG_MS as i64 && !self.deadline_reported && !self.shared.paused.load(Relaxed) {
+                self.deadline_reported = true;
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.record(Diagnostic::AudioLate {
+                        late_ms: self.deadline_balance_ms as u64,
+                        queue: self.shared.queued.load(Relaxed),
+                    });
+                }
+            } else if self.deadline_balance_ms <= 0 {
+                self.deadline_reported = false;
+            }
+        }
+        self.refill_at = Some(now);
+        self.pause_epoch = pause_epoch;
     }
 }
 
@@ -548,15 +852,22 @@ impl rodio::Source for PcmSource {
     }
 }
 
-fn decode_loop(
-    commands: Receiver<Cmd>,
-    replies: Sender<Cmd>,
-    pcm: SyncSender<Chunk>,
+struct DecodeWorker {
     shared: Arc<Shared>,
     yt: Arc<ytm::Client>,
     urls: Urls,
     wake: Wake,
-) {
+    diagnostics: Option<AudioDiagnostics>,
+}
+
+fn decode_loop(commands: Receiver<Cmd>, replies: Sender<Cmd>, pcm: SyncSender<Chunk>, worker: DecodeWorker) {
+    let DecodeWorker {
+        shared,
+        yt,
+        urls,
+        wake,
+        diagnostics,
+    } = worker;
     let mut track: Option<Track> = None;
     let mut pending: Option<Chunk> = None;
     let mut resume: Option<u64> = None;
@@ -566,7 +877,9 @@ fn decode_loop(
     loop {
         if let Some(chunk) = pending.take() {
             match pcm.try_send(chunk) {
-                Ok(()) => {}
+                Ok(()) => {
+                    shared.queued.fetch_add(1, Relaxed);
+                }
                 Err(TrySendError::Full(chunk)) => pending = Some(chunk),
                 Err(TrySendError::Disconnected(_)) => return,
             }
@@ -604,7 +917,8 @@ fn decode_loop(
                     (recoveries, recovered_from) = (0, None);
                 }
                 (track, pending, resume, epoch) = (None, None, resume_ms, started);
-                let (replies, shared, yt, urls) = (replies.clone(), shared.clone(), yt.clone(), urls.clone());
+                let (replies, shared, yt, urls, diagnostics) =
+                    (replies.clone(), shared.clone(), yt.clone(), urls.clone(), diagnostics.clone());
                 std::thread::spawn(move || {
                     let is_current = || shared.generation.load(Relaxed) == generation;
                     let mut attempt = retry;
@@ -618,17 +932,19 @@ fn decode_loop(
                                 return;
                             }
                         }
-                        let opened = Track::open_if(&yt, &urls, &video_id, generation, &shared, &is_current).or_else(|message| {
-                            if message.unavailable {
-                                return Err(message);
-                            }
-                            urls.lock().unwrap().remove(&video_id);
-                            if is_current() && yt.refresh_clients() {
-                                Track::open_if(&yt, &urls, &video_id, generation, &shared, &is_current)
-                            } else {
-                                Err(message)
-                            }
-                        });
+                        let opened = Track::open_if(&yt, &urls, &video_id, generation, &shared, diagnostics.clone(), &is_current).or_else(
+                            |message| {
+                                if message.unavailable {
+                                    return Err(message);
+                                }
+                                urls.lock().unwrap().remove(&video_id);
+                                if is_current() && yt.refresh_clients() {
+                                    Track::open_if(&yt, &urls, &video_id, generation, &shared, diagnostics.clone(), &is_current)
+                                } else {
+                                    Err(message)
+                                }
+                            },
+                        );
                         attempt += 1;
                         if opened.is_ok() || opened.as_ref().is_err_and(|error| error.unavailable) || retry_delay(attempt).is_none() {
                             break opened;
@@ -649,6 +965,11 @@ fn decode_loop(
                 });
             }
             Some(Cmd::Opened(mut opened)) if current(opened.generation) => {
+                if let Some(diagnostics) = &diagnostics {
+                    diagnostics.record(Diagnostic::TrackOpened {
+                        video_id: opened.video_id.clone(),
+                    });
+                }
                 if let Some(ms) = resume.take() {
                     opened.seek(ms);
                 }
@@ -752,12 +1073,21 @@ impl Speaker {
     fn open(&mut self, player: &mut Player) {
         self.device_lost.store(false, Relaxed);
         let lost = self.device_lost.clone();
+        let diagnostics = player.diagnostics.clone();
         let notice_loss = move |error| {
             lost.fetch_or(matches!(error, rodio::cpal::StreamError::DeviceNotAvailable), Relaxed);
+            if let Some(diagnostics) = &diagnostics {
+                diagnostics.record(Diagnostic::DeviceError(error.to_string()));
+            }
         };
         let stream = rodio::OutputStreamBuilder::from_default_device()
             .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
             .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
+        if let Err(error) = &stream
+            && let Some(diagnostics) = &player.diagnostics
+        {
+            diagnostics.record(Diagnostic::DeviceError(error.to_string()));
+        }
         self.stream = stream.ok().map(|mut stream| {
             stream.log_on_drop(false);
             player.connect(stream.mixer());
@@ -820,6 +1150,7 @@ pub struct Player {
     sink: Option<rodio::Sink>,
     chunks: Chunks,
     wake: Wake,
+    diagnostics: Option<AudioDiagnostics>,
     volume: f32,
     yt: Arc<ytm::Client>,
     urls: Urls,
@@ -828,19 +1159,28 @@ pub struct Player {
 impl Player {
     pub fn new(yt: Arc<ytm::Client>, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let wake: Wake = Arc::new(wake);
+        let diagnostics = AudioDiagnostics::start();
         let shared = Arc::new(Shared::default());
         shared.paused.store(true, Relaxed);
         let urls = Urls::default();
         let (commands, inbox) = mpsc::channel();
         let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
-        let worker = (commands.clone(), shared.clone(), yt.clone(), urls.clone(), wake.clone());
-        std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, worker.1, worker.2, worker.3, worker.4));
+        let worker = DecodeWorker {
+            shared: shared.clone(),
+            yt: yt.clone(),
+            urls: urls.clone(),
+            wake: wake.clone(),
+            diagnostics: diagnostics.clone(),
+        };
+        let replies = commands.clone();
+        std::thread::spawn(move || decode_loop(inbox, replies, pcm, worker));
         Self {
             commands,
             shared,
             sink: None,
             chunks: Arc::new(Mutex::new(chunks)),
             wake,
+            diagnostics,
             volume: 1.0,
             yt,
             urls,
@@ -856,7 +1196,12 @@ impl Player {
         sink.pause();
         self.shared.paused.store(true, Relaxed);
         sink.set_volume(self.volume * self.volume);
-        sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
+        sink.append(PcmSource::new(
+            self.chunks.clone(),
+            self.shared.clone(),
+            self.wake.clone(),
+            self.diagnostics.clone(),
+        ));
         self.sink = Some(sink);
     }
 
@@ -866,6 +1211,9 @@ impl Player {
     }
 
     fn fail(&self, message: &str) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(Diagnostic::DeviceError(message.to_owned()));
+        }
         *self.shared.error.lock().unwrap() = Some(message.to_owned().into());
         (self.wake)();
     }
@@ -881,6 +1229,11 @@ impl Player {
         self.shared.failed.store(false, Relaxed);
         self.shared.buffering.store(false, Relaxed);
         self.shared.error.lock().unwrap().take();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record(Diagnostic::TrackLoad {
+                video_id: video_id.to_owned(),
+            });
+        }
         let _ = self.commands.send(Cmd::Load {
             video_id: video_id.to_owned(),
             generation,
@@ -905,7 +1258,11 @@ impl Player {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.shared.paused.store(paused || self.sink.is_none(), Relaxed);
+        let paused = paused || self.sink.is_none();
+        let was_paused = self.shared.paused.swap(paused, Relaxed);
+        if paused && !was_paused {
+            self.shared.pause_epoch.fetch_add(1, Relaxed);
+        }
         if let Some(sink) = &self.sink {
             if paused { sink.pause() } else { sink.play() }
         }
@@ -1065,7 +1422,7 @@ mod tests {
         let shared = Arc::new(Shared::default());
         let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
         let chunks: Chunks = Arc::new(Mutex::new(chunks));
-        let open = || PcmSource::new(chunks.clone(), shared.clone(), Arc::new(|| {}));
+        let open = || PcmSource::new(chunks.clone(), shared.clone(), Arc::new(|| {}), None);
         let queue = |start_ms| {
             let chunk = Chunk {
                 samples: vec![0.5; 4],
@@ -1085,5 +1442,28 @@ mod tests {
         assert_eq!(second.by_ref().take(SILENCE_SAMPLES + 4).filter(|sample| *sample == 0.5).count(), 4);
         assert_eq!(shared.position_ms.load(Relaxed), 2000);
         assert!(queue(3000));
+    }
+
+    #[test]
+    fn pcm_starvation_and_recovery_are_diagnostic_events() {
+        let shared = Arc::new(Shared::default());
+        let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
+        let chunks = Arc::new(Mutex::new(chunks));
+        let (diagnostics, events) = AudioDiagnostics::channel();
+        let mut source = PcmSource::new(chunks, shared.clone(), Arc::new(|| {}), Some(diagnostics));
+        assert!(source.by_ref().take(SILENCE_SAMPLES + 1).all(|sample| sample == 0.0));
+        assert!(matches!(events.recv().unwrap().1, Diagnostic::QueueStarved { queue: 0 }));
+        pcm.send(Chunk {
+            samples: vec![0.5; 4],
+            start_ms: 1000,
+            epoch: 0,
+            rate: 48_000,
+            channels: 2,
+            end: false,
+        })
+        .unwrap();
+        assert!(source.by_ref().take(SILENCE_SAMPLES).any(|sample| sample == 0.5));
+        assert!(matches!(events.recv().unwrap().1, Diagnostic::QueueRecovered { queue: 0, .. }));
+        assert!(events.try_recv().is_err());
     }
 }

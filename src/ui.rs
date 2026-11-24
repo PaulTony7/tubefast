@@ -2137,6 +2137,21 @@ fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     });
 }
 
+fn updates_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    section(ui, "Updates", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(
+            ui,
+            size,
+            icon::ARROW_CIRCLE_UP,
+            "Check for updates automatically",
+            app.saved.auto_update_checks,
+        ) {
+            out.push(Action::AutoUpdateChecks(!app.saved.auto_update_checks));
+        }
+    });
+}
+
 fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, enabled: bool) -> Option<f32> {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let middle = rect.center().y;
@@ -2234,6 +2249,7 @@ fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     discord_section(ui, app, out);
     hotkey_section(ui, app, out);
     window_section(ui, app, out);
+    updates_section(ui, app, out);
     overlay_section(ui, app, out);
 }
 

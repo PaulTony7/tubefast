@@ -1,3 +1,5 @@
+- Automatic update checks are now off by default and can be enabled in Settings
+- Audio diagnostics now record buffering, stream, decoder and device delays to help investigate playback stutters
 - Settings can send Tubefast to the system tray when you close the window, now also on macOS and Linux
 - Global hotkeys now also work on macOS and on Linux, with X11 or with Wayland through the desktop's shortcuts portal, where the keys are set in the system settings. If your desktop has no shortcuts portal, Settings now tells you
 - The media overlay now also works on macOS and on Linux with X11. On Wayland it is not available
@@ -14,3 +16,4 @@
 - Changing tracks stops stream lookups that are no longer needed
 - Browse podcast shows and play their episodes from the Podcasts sidebar entry
 - Unavailable videos are skipped without skipping songs for connection or sign-in failures
+- Podcasts and videos play their original audio instead of an automatically dubbed language

@@ -94,6 +94,7 @@ pub struct Saved {
     pub overlay_position: Option<[f32; 2]>,
     pub overlay_controls: bool,
     pub overlay_next_up: bool,
+    pub auto_update_checks: bool,
     pub notes_seen: String,
     pub browser: String,
 }
@@ -175,6 +176,7 @@ impl Default for Saved {
             overlay_position: None,
             overlay_controls: true,
             overlay_next_up: true,
+            auto_update_checks: false,
             notes_seen: String::new(),
             browser: String::new(),
         }
@@ -241,6 +243,7 @@ pub enum Action {
     GetUpdate,
     OpenRelease,
     CloseNotes,
+    AutoUpdateChecks(bool),
     #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
     Pause(bool),
     Move(usize, usize),
@@ -439,10 +442,10 @@ impl App {
         auth::secure_session_storage();
         auth::remove_leftover_sign_in_profiles();
         app.restore_account();
+        app.check_for_update();
         app.background(|yt| {
             yt.refresh_clients();
-            let latest = yt.agent.head(LATEST_RELEASE).call().ok()?;
-            newer_version(latest.get_url(), VERSION).map(Event::Release)
+            None
         });
         app
     }
@@ -811,6 +814,9 @@ impl App {
                     }
                 }
                 Event::Release(version) => {
+                    if !self.saved.auto_update_checks {
+                        continue;
+                    }
                     self.offer(
                         format!("{APP_NAME} {version} is out"),
                         Some(("Update", Action::GetUpdate)),
@@ -884,6 +890,16 @@ impl App {
             return;
         }
         self.tray = Tray::start(self.window, self.ctx.clone());
+    }
+
+    fn check_for_update(&self) {
+        if !self.saved.auto_update_checks {
+            return;
+        }
+        self.background(|yt| {
+            let latest = yt.agent.head(LATEST_RELEASE).call().ok()?;
+            newer_version(latest.get_url(), VERSION).map(Event::Release)
+        });
     }
 
     fn set_recording(&mut self, command: Option<Command>) {
@@ -1153,6 +1169,21 @@ impl App {
                 self.notice = None;
                 self.ctx.open_url(egui::OpenUrl::new_tab(LATEST_RELEASE));
             }
+            Action::AutoUpdateChecks(enabled) => {
+                self.saved.auto_update_checks = enabled;
+                if enabled {
+                    self.check_for_update();
+                } else {
+                    self.update = None;
+                    if self
+                        .notice
+                        .as_ref()
+                        .is_some_and(|notice| matches!(notice.action, Some((_, Action::GetUpdate))))
+                    {
+                        self.notice = None;
+                    }
+                }
+            }
             Action::CloseNotes => self.notes.clear(),
             Action::Move(from, gap) => playback.reorder(from, gap),
             Action::Expand(open) => self.expanded = open && self.saved.current.is_some(),
@@ -1388,9 +1419,10 @@ mod tests {
     }
 
     #[test]
-    fn old_saves_show_every_overlay_part() {
+    fn old_saves_keep_compatible_defaults() {
         let saved: Saved = serde_json::from_str(r#"{"volume":0.5,"overlay":true}"#).unwrap();
         assert!(saved.overlay_controls && saved.overlay_next_up);
+        assert!(!saved.auto_update_checks);
         let saved: Saved = serde_json::from_str(r#"{"overlay_controls":false}"#).unwrap();
         assert!(!saved.overlay_controls && saved.overlay_next_up);
     }
